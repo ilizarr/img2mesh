@@ -66,28 +66,24 @@ class KaolinData(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.num_samples = len(glob.glob(os.path.join(self.root_dir,'*_rgb.png')))
-        self.last = 10
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # i = 2 if self.last == 10 else 10
-        # self.last = i
 
         data = import_synthetic_view(self.root_dir, idx, rgb=True, semantic=True)
         sample = {
             'semantic': data['semantic'],
             'cam_transform': data['metadata']['cam_transform'],
             'cam_proj': data['metadata']['cam_proj'],
-            'rgb': data['rgb'],
             'rgb_orig': torch.from_numpy(
                 np.array(data['rgb'])
             )[:, :, :3].float().permute(2,0,1)  / 255.
         }
         # Convert (H x W x C) to (C x H x W)
         if self.transform is not None:
-            sample['rgb'] = self.transform(sample['rgb'])
+            sample['rgb'] = self.transform(data['rgb'])
         else:
             sample['rgb'] = torch.from_numpy(
                 np.array(data['rgb'])
@@ -95,7 +91,7 @@ class KaolinData(Dataset):
         return sample
 
 # Preprocess input image for VGG16 encoder
-vgg16_preprocess = preprocess = transforms.Compose([
+vgg16_preprocess = transforms.Compose([
     transforms.Resize((224,224)),
     transforms.ToTensor()
     #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
