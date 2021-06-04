@@ -131,4 +131,5 @@ dmypy.json
 .vscode/
 
 logs/
+weights/
 
