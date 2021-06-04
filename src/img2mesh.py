@@ -3,7 +3,7 @@ from matplotlib import pyplot as plt
 import torch
 import kaolin as kal
 
-from model import create_model
+from model import create_base_model, create_cnn_encoder_model
 from dataset import load_kaolin_data, vgg16_preprocess
 
 # Use GPU if available, else CPU
@@ -12,6 +12,7 @@ print('Using device:', device)
 if device.type == 'cuda':
     print(torch.cuda.get_device_name(0))
     print('Memory Usage:')
+    print('Total:', round(torch.cuda.get_device_properties(0).total_memory/1024**3,1), 'GB')
     print('Allocated:', round(torch.cuda.memory_allocated(0)/1024**3,1), 'GB')
     print('Cached:   ', round(torch.cuda.memory_reserved(0)/1024**3,1), 'GB')
 
@@ -46,7 +47,6 @@ def render(height, width, vertices, mesh_shift, vertex_colors, faces, cam_transf
     # Construct attributes that DIB-R rasterizer will interpolate.
     # the first will render into an image without the need for texture mapping
     # the second will make a hard segmentation mask
-    #vertex_colors = torch.clamp(vertex_colors, 0., 1.)
     face_vert_colors = kal.ops.mesh.index_vertices_by_faces(vertex_colors, faces)
     face_attributes = [
         face_vert_colors,
@@ -59,7 +59,7 @@ def render(height, width, vertices, mesh_shift, vertex_colors, faces, cam_transf
 
     # image_features is a tuple in composed of the interpolated attributes of face_attributes
     image_color, mask = image_features
-    image = torch.clamp(image_color, 0., 1.)# * mask, 0., 1.)
+    image = torch.clamp(image_color, 0., 1.)
     # Convert (B x H x W x C) to (B x C x H x W)
     image = image.permute(0, 3, 1, 2) 
 
@@ -140,31 +140,34 @@ def save_plots_no_model(dirname, epoch_num, data_set, elem_ids, vertices_alt, ve
         plt.savefig(f"{dirname}/pred-vs-truth-epoch-{epoch_num}.png")
         plt.close('all')
 
-# path to the output logs
+# path to the output logs/status
 logs_path = './logs/'
 
-# Hyperparameters
 skip_model = False
-num_epoch = 30
+base_model = False
+save_weights = True
+load_weights = True
+weight_file = "./weights/base/checkpoint.pt" if base_model else "./weights/cnn_encoder/checkpoint.pt"
+
+# Hyperparameters
+num_epoch = 40
 flat_weight = 1e-3 if skip_model else 1e-3
 edge_weight = 1e-8 if skip_model else 1e-8
 image_weight = 0.1 if skip_model else 0.1
 mask_weight = 1.   if skip_model else 10.
 lr = 5e-2 if skip_model else 1e-5
-scheduler_step_size = 15
+scheduler_step_size = 5
 scheduler_gamma = 0.5
 
 # Load data
-batch_size = 1 if skip_model else 1
+batch_size = 1 if skip_model else 2
 views_per_batch = 2
-data_transform = vgg16_preprocess if not skip_model else None
+data_transform = vgg16_preprocess if not skip_model and base_model else None
 full_dataset, dataloader_train, dataloader_val = load_kaolin_data("../kaolin/examples/samples/rendered_clock/", train_split=0.8, batch_size=batch_size, \
     views_per_batch = views_per_batch, transform=data_transform)
 
 # Load base mesh that the model will deform
 mesh = kal.io.obj.import_mesh('../kaolin/examples/samples/sphere.obj', with_materials=True)
-# vertices_alt = mesh.vertices.cuda().unsqueeze(0) * 75
-# vertices_alt.requires_grad = True
 vertices_init = mesh.vertices.cuda().unsqueeze(0) * 75 # 75 - default sphere is too small...(TODO)
 vertices_init.requires_grad = False
 faces = mesh.faces.cuda()                            
@@ -175,7 +178,16 @@ face_size = 3
 
 # Create the model
 if not skip_model:
-    model = create_model(num_views=views_per_batch, num_vertices=nb_vertices, att_heads=2, att_layers=1)
+    if base_model:
+        model = create_base_model(num_views=views_per_batch, num_vertices=nb_vertices, att_heads=2, att_layers=1)
+    else:
+        model = create_cnn_encoder_model(num_views=views_per_batch, num_vertices=nb_vertices, att_heads=2, att_layers=1)
+    
+    if load_weights:
+        print(f"Loading model weights from {weight_file}")
+        checkpoint = torch.load(weight_file)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
     model.to(device)
     model.train()
 
@@ -210,10 +222,15 @@ else:
     vertices_color_alt = torch.ones(vertices_alt.shape, dtype=torch.float, device='cuda', requires_grad=True)
     optim  = torch.optim.Adam(params=[vertices_alt, vertices_color_alt, vertice_shift_alt], lr=lr)
 
-scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=scheduler_step_size, gamma=scheduler_gamma)
+if not skip_model and load_weights:
+    print(f"Loading optimizer state from {weight_file}")
+    optim.load_state_dict(checkpoint['opt_state_dict'])
+
+scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=scheduler_step_size, gamma=scheduler_gamma, verbose=True)
 for epoch in range(num_epoch):
+    loss_sum = 0.0
+    counter = 0.0
     for b_idx, data in enumerate(dataloader_train):
-    
         # Load data 
         gt_mask = data['semantic'].cuda() # (N*V x H x W x 1)
         orig_image = data['rgb_orig'].cuda()  # (N*V x C x H x W) 
@@ -271,7 +288,7 @@ for epoch in range(num_epoch):
         faces_cos = torch.sum(mesh_normals_e1 * mesh_normals_e2, dim=2)
         flat_loss = torch.mean((faces_cos - 1) ** 2) * edge2faces.shape[0]
         # Edge length loss
-        # edges: nb_edges x 2
+        #   edges: (nb_edges x 2)
         edges_p1 = vertices[:, edges[:,0]] # (N*V x nb_edges x 3)
         edges_p2 = vertices[:, edges[:,1]] # (N*V x nb_edges x 3)
         edges_vec = edges_p2 - edges_p1
@@ -284,6 +301,8 @@ for epoch in range(num_epoch):
             flat_loss * flat_weight +
             edge_loss * edge_weight
         )
+        loss_sum += loss.item()
+        counter += 1
 
         ### Update the mesh ###
         optim.zero_grad()
@@ -291,7 +310,7 @@ for epoch in range(num_epoch):
         optim.step()
 
     scheduler.step()
-    print(f"Epoch {epoch} - loss: {float(loss)}")
+    print(f"Epoch {epoch} - avg training loss: {loss_sum/counter} - num batches: {counter}")
    
     # Save epoch progress using plots (5)
     if not skip_model:
@@ -301,3 +320,9 @@ for epoch in range(num_epoch):
     else:
         save_plots_no_model(logs_path, epoch, full_dataset, [2, 10], vertices_alt, vertices_color_alt, vertice_shift_alt, faces)
 # for each epoch
+
+if not skip_model and save_weights:
+    print(f"Saving weights to {weight_file}")
+    torch.save({'model_state_dict': model.state_dict(), 'opt_state_dict': optim.state_dict()}, weight_file)
+
+print("DONE!")

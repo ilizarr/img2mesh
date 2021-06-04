@@ -63,6 +63,7 @@ class KaolinData(Dataset):
             transform (callable, optional): Optional transform to be applied
                 on the RGB images.
         """
+        super(KaolinData, self).__init__()
         self.root_dir = root_dir
         self.transform = transform
         self.num_samples = len(glob.glob(os.path.join(self.root_dir,'*_rgb.png')))
